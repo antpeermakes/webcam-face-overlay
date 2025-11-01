@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Character Face Overlay (MVP)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body{margin:0;background:#0b0c10;color:#e6e6e6;font-family:system-ui,Arial}
+    header{padding:12px 16px;border-bottom:1px solid #222;display:flex;gap:12px;align-items:center}
+    main{display:grid;grid-template-columns:1fr 360px;gap:12px;padding:12px}
+    #stage{position:relative;background:#111;border:1px solid #222;border-radius:10px;overflow:hidden;aspect-ratio:16/9}
+    #video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1)} /* mirror */
+    #canvas{position:absolute;inset:0}
+    .panel{border:1px solid #222;border-radius:10px;padding:12px;background:#0f1014}
+    label{display:block;margin:8px 0 4px;color:#bbb}
+    input[type=range]{width:100%}
+    button{background:#1f6feb;color:#fff;border:none;padding:8px 12px;border-radius:8px;cursor:pointer}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    small{color:#9aa0a6}
+  </style>
+  <!-- MediaPipe FaceMesh (no build step) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4/face_mesh.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.2/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3/drawing_utils.js"></script>
+</head>
+<body>
+  <header>
+    <button id="startBtn">Start Camera + Mic</button>
+    <div id="status">Idle</div>
+  </header>
+
+  <main>
+    <div id="stage">
+      <video id="video" playsinline muted></video>
+      <canvas id="canvas"></canvas>
+    </div>
+
+    <div class="panel">
+      <h3>Overlay Settings</h3>
+      <label>Character</label>
+      <select id="character">
+        <option value="default">Default</option>
+      </select>
+
+      <label>Scale Multiplier <span id="scaleVal">1.6</span></label>
+      <input type="range" id="scaleMul" min="1.0" max="2.5" step="0.01" value="1.6">
+
+      <label>Offset X (px) <span id="offxVal">0</span></label>
+      <input type="range" id="offx" min="-500" max="500" step="1" value="0" style="width:100%">
+
+      <label>Offset Y (px) <span id="offyVal">40</span></label>
+      <input type="range" id="offy" min="-500" max="500" step="1" value="40">
+
+      <label>Speech Threshold <span id="thrVal">0.035</span></label>
+      <input type="range" id="speechThr" min="0.005" max="0.12" step="0.001" value="0.035">
+
+      <label>Smoothing (EMA) <span id="smVal">0.25</span></label>
+      <input type="range" id="smooth" min="0" max="0.9" step="0.01" value="0.25">
+
+      <p><small>Tip: lower Speech Threshold if mouth rarely opens; raise if always open.</small></p>
+    </div>
+  </main>
+
+<script>
+(async function(){
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const startBtn = document.getElementById('startBtn');
+  const statusEl = document.getElementById('status');
+
+  const scaleMulEl = document.getElementById('scaleMul');
+  const offxEl = document.getElementById('offx');
+  const offyEl = document.getElementById('offy');
+  const thrEl  = document.getElementById('speechThr');
+  const smoothEl = document.getElementById('smooth');
+  const scaleVal = document.getElementById('scaleVal');
+  const offxVal  = document.getElementById('offxVal');
+  const offyVal  = document.getElementById('offyVal');
+  const thrVal   = document.getElementById('thrVal');
+  const smVal    = document.getElementById('smVal');
+
+  const updateLabels = () => {
+    scaleVal.textContent = (+scaleMulEl.value).toFixed(2);
+    offxVal.textContent  = offxEl.value;
+    offyVal.textContent  = offyEl.value;
+    thrVal.textContent   = (+thrEl.value).toFixed(3);
+    smVal.textContent    = (+smoothEl.value).toFixed(2);
+  };
+  ['input','change'].forEach(evt=>{
+    [scaleMulEl, offxEl, offyEl, thrEl, smoothEl].forEach(el=>el.addEventListener(evt, updateLabels));
+  });
+  updateLabels();
+
+  // Load character assets
+  const charBase = new Image();
+  const charMouth = new Image();
+  charBase.src = 'assets/char_base.png';
+  charMouth.src = 'assets/char_mouth.png';
+  await Promise.all([
+    new Promise(r=>charBase.onload=r),
+    new Promise(r=>charMouth.onload=r),
+  ]);
+
+  // MediaPipe FaceMesh setup
+  const faceMesh = new FaceMesh.FaceMesh({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4/${file}`
+  });
+  faceMesh.setOptions({
+    maxNumFaces: 1,
+    refineLandmarks: true, // iris + lips detail
+    minDetectionConfidence: 0.5,
+    minTrackingConfidence: 0.5
+  });
+
+  let lastPose = {x:0, y:0, scale:250, rot:0}; // pixels, radians
+  let emaPose = {...lastPose};
+  let mouthOpen = false;
+  let lastSpeech = 0;
+
+  function ema(current, next, alpha){
+    return current + alpha * (next - current);
+  }
+
+  // Landmark indices (MediaPipe FaceMesh)
+  const LEFT_EYE_OUTER = 33;
+  const RIGHT_EYE_OUTER = 263;
+  const NOSE_TIP = 1; // good anchor
+
+  function estimatePose(landmarks, w, h) {
+    const le = landmarks[LEFT_EYE_OUTER];
+    const re = landmarks[RIGHT_EYE_OUTER];
+    const nose = landmarks[NOSE_TIP];
+
+    const lx = le.x * w, ly = le.y * h;
+    const rx = re.x * w, ry = re.y * h;
+    const nx = nose.x * w, ny = nose.y * h;
+
+    const cx = (lx + rx) / 2;
+    const cy = (ly + ry) / 2;
+
+    const dx = rx - lx;
+    const dy = ry - ly;
+    const eyeDist = Math.hypot(dx, dy);
+    const rot = Math.atan2(dy, dx);
+
+    // Base scale proportional to eye distance
+    const scale = eyeDist * (+scaleMulEl.value);
+
+    // Position anchored a bit below eyes toward nose
+    const ax = nx;
+    const ay = ny;
+
+    return {
+      x: ax + (+offxEl.value),
+      y: ay + (+offyEl.value),
+      scale,
+      rot
+    };
+  }
+
+  faceMesh.onResults((results) => {
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+
+    // Keep canvas sized to video
+    if (canvas.width !== vw || canvas.height !== vh) {
+      canvas.width = vw; canvas.height = vh;
+    }
+
+    // Draw mirrored video frame underlays done by <video> element itself.
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+
+    if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) {
+      // No face; optionally draw character faded or skip.
+      return;
+    }
+
+    const landmarks = results.multiFaceLandmarks[0];
+    const pose = estimatePose(landmarks, vw, vh);
+
+    const a = +smoothEl.value;
+    emaPose.x = ema(emaPose.x, pose.x, a);
+    emaPose.y = ema(emaPose.y, pose.y, a);
+    emaPose.scale = ema(emaPose.scale, pose.scale, a);
+    emaPose.rot = ema(emaPose.rot, pose.rot, a);
+
+    // Composite character
+    ctx.save();
+    // Mirror matching the <video> mirror (flip X around center)
+    ctx.translate(vw/2, vh/2);
+    ctx.scale(-1, 1);
+    ctx.translate(-vw/2, -vh/2);
+
+    // Transform around the anchor (emaPose.x, emaPose.y)
+    ctx.translate(emaPose.x, emaPose.y);
+    ctx.rotate(emaPose.rot);
+    const s = emaPose.scale; // use uniform scale based on eye distance
+    const iw = charBase.width;
+    const ih = charBase.height;
+    const drawW = s;
+    const drawH = s * (ih / iw);
+
+    // Draw base centered
+    ctx.drawImage(charBase, -drawW/2, -drawH/2, drawW, drawH);
+
+    // If speaking, draw mouth overlay
+    if (mouthOpen) {
+      ctx.globalAlpha = 1.0;
+      ctx.drawImage(charMouth, -drawW/2, -drawH/2, drawW, drawH);
+    }
+
+    ctx.restore();
+  });
+
+  // Web Audio: measure loudness to detect speech
+  let audioCtx, analyser, micSource, dataArray;
+  function setupAudio(stream) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    const bufferLength = analyser.fftSize;
+    dataArray = new Uint8Array(bufferLength);
+
+    micSource = audioCtx.createMediaStreamSource(stream);
+    micSource.connect(analyser);
+  }
+
+  function getRMS() {
+    analyser.getByteTimeDomainData(dataArray);
+    let sum = 0;
+    for (let i=0;i<dataArray.length;i++) {
+      const v = (dataArray[i]-128)/128; // normalize [-1,1]
+      sum += v*v;
+    }
+    return Math.sqrt(sum / dataArray.length);
+  }
+
+  // Frame loop to update speech state + ask FaceMesh to process frames
+  let camera;
+  async function start() {
+    startBtn.disabled = true;
+    statusEl.textContent = 'Requesting permissions...';
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: true
+    });
+
+    video.srcObject = stream;
+    await video.play();
+
+    setupAudio(stream);
+
+    // MediaPipe camera helper (feeds frames to FaceMesh)
+    camera = new CameraUtils.Camera(video, {
+      onFrame: async () => {
+        await faceMesh.send({image: video});
+        // Update mouth state from audio RMS (with hysteresis)
+        const rms = getRMS();
+        const thr = +thrEl.value;
+        const now = performance.now();
+
+        // Simple hysteresis: if above threshold, open; if below 0.7*thr for >80ms, close
+        if (rms > thr) {
+          mouthOpen = true;
+          lastSpeech = now;
+        } else if (mouthOpen && (rms < thr * 0.7) && (now - lastSpeech > 80)) {
+          mouthOpen = false;
+        }
+      },
+      width: video.videoWidth || 1280,
+      height: video.videoHeight || 720
+    });
+
+    await camera.start();
+    statusEl.textContent = 'Running';
+  }
+
+  startBtn.addEventListener('click', start);
+})();
+</script>
+</body>
+</html>
